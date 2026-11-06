@@ -1,0 +1,525 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create project files
+        run: |
+          mkdir -p app/src/main/java/com/gabra/dupaudio
+          cat > settings.gradle <<'EOF_X'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'DupAudioCleaner'
+          include ':app'
+          EOF_X
+          cat > build.gradle <<'EOF_X'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF_X
+          cat > gradle.properties <<'EOF_X'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          EOF_X
+          cat > app/build.gradle <<'EOF_X'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.gabra.dupaudio'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.gabra.dupaudio'
+                  minSdk 21
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      signingConfig signingConfigs.debug
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              lint {
+                  abortOnError false
+                  checkReleaseBuilds false
+              }
+          }
+          EOF_X
+          cat > app/src/main/AndroidManifest.xml <<'EOF_X'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+              <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+
+              <application
+                  android:label="منظف الصوت المكرر"
+                  android:icon="@android:drawable/ic_menu_delete"
+                  android:supportsRtl="true"
+                  android:requestLegacyExternalStorage="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_X
+          cat > app/src/main/java/com/gabra/dupaudio/MainActivity.java <<'EOF_X'
+          package com.gabra.dupaudio;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.app.PendingIntent;
+          import android.content.ContentResolver;
+          import android.content.ContentUris;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.database.Cursor;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.provider.MediaStore;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ProgressBar;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+
+          import java.io.File;
+          import java.io.InputStream;
+          import java.security.MessageDigest;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+
+          public class MainActivity extends Activity {
+
+              private static final int REQ_PERM = 1;
+              private static final int REQ_DELETE = 2;
+
+              private TextView status;
+              private TextView details;
+              private Button button;
+              private ProgressBar progress;
+
+              private final Handler ui = new Handler(Looper.getMainLooper());
+              private final ArrayList<Item> toDelete = new ArrayList<>();
+              private long bytesToFree = 0;
+              private boolean busy = false;
+
+              static class Item {
+                  long id;
+                  long size;
+                  String path;
+                  Uri uri;
+                  String hash;
+              }
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  int pad = dp(20);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(pad, dp(36), pad, pad);
+                  root.setBackgroundColor(Color.parseColor("#F4F6F8"));
+                  root.setLayoutDirection(View.LAYOUT_DIRECTION_RTL);
+
+                  TextView title = new TextView(this);
+                  title.setText("منظّف الصوت المكرر");
+                  title.setTextSize(24);
+                  title.setTypeface(Typeface.DEFAULT_BOLD);
+                  title.setTextColor(Color.parseColor("#1F2937"));
+                  title.setGravity(Gravity.CENTER);
+                  root.addView(title);
+
+                  button = new Button(this);
+                  button.setText("افحص وامحي المكرر");
+                  button.setTextSize(20);
+                  button.setAllCaps(false);
+                  button.setTextColor(Color.WHITE);
+                  button.setBackgroundColor(Color.parseColor("#2563EB"));
+                  LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, dp(64));
+                  bp.topMargin = dp(24);
+                  root.addView(button, bp);
+                  button.setOnClickListener(v -> onButton());
+
+                  progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+                  progress.setVisibility(View.GONE);
+                  LinearLayout.LayoutParams pp = new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+                  pp.topMargin = dp(16);
+                  root.addView(progress, pp);
+
+                  status = new TextView(this);
+                  status.setTextSize(17);
+                  status.setTextColor(Color.parseColor("#111827"));
+                  status.setGravity(Gravity.CENTER);
+                  LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+                  sp.topMargin = dp(16);
+                  root.addView(status, sp);
+
+                  ScrollView scroll = new ScrollView(this);
+                  details = new TextView(this);
+                  details.setTextSize(13);
+                  details.setTextColor(Color.parseColor("#374151"));
+                  details.setTextDirection(View.TEXT_DIRECTION_LTR);
+                  scroll.addView(details);
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
+                  lp.topMargin = dp(12);
+                  root.addView(scroll, lp);
+
+                  setContentView(root);
+
+                  // one tap = open the app: start right away
+                  start();
+              }
+
+              private int dp(int v) {
+                  return Math.round(v * getResources().getDisplayMetrics().density);
+              }
+
+              private void onButton() {
+                  if (busy) return;
+                  if (!toDelete.isEmpty()) deleteDuplicates();
+                  else start();
+              }
+
+              // ---------------- permissions ----------------
+
+              private String[] neededPermissions() {
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      return new String[]{Manifest.permission.READ_MEDIA_AUDIO};
+                  } else if (Build.VERSION.SDK_INT >= 30) {
+                      return new String[]{Manifest.permission.READ_EXTERNAL_STORAGE};
+                  } else {
+                      return new String[]{Manifest.permission.READ_EXTERNAL_STORAGE,
+                              Manifest.permission.WRITE_EXTERNAL_STORAGE};
+                  }
+              }
+
+              private boolean hasPermissions() {
+                  if (Build.VERSION.SDK_INT < 23) return true;
+                  for (String p : neededPermissions()) {
+                      if (checkSelfPermission(p) != PackageManager.PERMISSION_GRANTED) return false;
+                  }
+                  return true;
+              }
+
+              private void start() {
+                  if (busy) return;
+                  if (hasPermissions()) scan();
+                  else if (Build.VERSION.SDK_INT >= 23) requestPermissions(neededPermissions(), REQ_PERM);
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
+                  super.onRequestPermissionsResult(requestCode, permissions, results);
+                  if (requestCode != REQ_PERM) return;
+                  if (hasPermissions()) scan();
+                  else status.setText("لازم تسمح للتطبيق يوصل لملفات الصوت.\nاضغط الزر وسمحلو.");
+              }
+
+              // ---------------- scan ----------------
+
+              private void scan() {
+                  busy = true;
+                  toDelete.clear();
+                  bytesToFree = 0;
+                  details.setText("");
+                  button.setEnabled(false);
+                  button.setText("عم يفحص...");
+                  progress.setVisibility(View.VISIBLE);
+                  progress.setIndeterminate(true);
+                  status.setText("عم يجمع ملفات الصوت...");
+
+                  new Thread(() -> {
+                      final StringBuilder report = new StringBuilder();
+                      String error = null;
+                      try {
+                          List<Item> all = queryAudio();
+                          post("لقيت " + all.size() + " ملف صوت. عم يقارن...");
+
+                          // 1) group by size: files with a unique size can't be duplicates
+                          Map<Long, List<Item>> bySize = new HashMap<>();
+                          for (Item it : all) {
+                              if (it.size <= 0) continue;
+                              List<Item> l = bySize.get(it.size);
+                              if (l == null) { l = new ArrayList<>(); bySize.put(it.size, l); }
+                              l.add(it);
+                          }
+                          List<Item> candidates = new ArrayList<>();
+                          for (List<Item> l : bySize.values()) if (l.size() > 1) candidates.addAll(l);
+
+                          // 2) hash only the candidates
+                          final int total = candidates.size();
+                          ui.post(() -> {
+                              progress.setIndeterminate(false);
+                              progress.setMax(Math.max(total, 1));
+                              progress.setProgress(0);
+                          });
+                          ContentResolver cr = getContentResolver();
+                          Map<String, List<Item>> byHash = new HashMap<>();
+                          for (int i = 0; i < total; i++) {
+                              Item it = candidates.get(i);
+                              it.hash = md5(cr, it.uri);
+                              if (it.hash != null) {
+                                  String key = it.size + ":" + it.hash;
+                                  List<Item> l = byHash.get(key);
+                                  if (l == null) { l = new ArrayList<>(); byHash.put(key, l); }
+                                  l.add(it);
+                              }
+                              final int done = i + 1;
+                              ui.post(() -> {
+                                  progress.setProgress(done);
+                                  status.setText("عم يقارن " + done + " / " + total);
+                              });
+                          }
+
+                          // 3) keep the shortest path in each group, mark the rest
+                          for (List<Item> group : byHash.values()) {
+                              if (group.size() < 2) continue;
+                              Collections.sort(group, (a, b) -> {
+                                  int c = Integer.compare(a.path.length(), b.path.length());
+                                  return c != 0 ? c : a.path.compareTo(b.path);
+                              });
+                              report.append("✔ يبقى: ").append(group.get(0).path).append('\n');
+                              for (int k = 1; k < group.size(); k++) {
+                                  Item d = group.get(k);
+                                  toDelete.add(d);
+                                  bytesToFree += d.size;
+                                  report.append("✘ يمحى: ").append(d.path).append('\n');
+                              }
+                              report.append('\n');
+                          }
+                      } catch (Exception e) {
+                          error = e.getMessage();
+                      }
+
+                      final String err = error;
+                      ui.post(() -> {
+                          busy = false;
+                          progress.setVisibility(View.GONE);
+                          button.setEnabled(true);
+                          if (err != null) {
+                              status.setText("صار خطأ: " + err);
+                              button.setText("جرّب مرة تانية");
+                              return;
+                          }
+                          details.setText(report.toString());
+                          if (toDelete.isEmpty()) {
+                              status.setText("✓ ما في ملفات صوت مكررة");
+                              button.setText("افحص مرة تانية");
+                          } else {
+                              status.setText("لقيت " + toDelete.size() + " ملف مكرر (" + mb(bytesToFree) + ")");
+                              button.setText("امحي المكرر (" + toDelete.size() + ")");
+                              deleteDuplicates();
+                          }
+                      });
+                  }).start();
+              }
+
+              private void post(final String s) {
+                  ui.post(() -> status.setText(s));
+              }
+
+              private List<Item> queryAudio() {
+                  List<Item> out = new ArrayList<>();
+                  Uri collection = Build.VERSION.SDK_INT >= 29
+                          ? MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+                          : MediaStore.Audio.Media.EXTERNAL_CONTENT_URI;
+                  String[] proj = {
+                          MediaStore.Audio.Media._ID,
+                          MediaStore.Audio.Media.SIZE,
+                          MediaStore.Audio.Media.DATA,
+                          MediaStore.Audio.Media.DISPLAY_NAME
+                  };
+                  try (Cursor c = getContentResolver().query(collection, proj, null, null, null)) {
+                      if (c == null) return out;
+                      int iId = c.getColumnIndexOrThrow(MediaStore.Audio.Media._ID);
+                      int iSize = c.getColumnIndexOrThrow(MediaStore.Audio.Media.SIZE);
+                      int iData = c.getColumnIndex(MediaStore.Audio.Media.DATA);
+                      int iName = c.getColumnIndex(MediaStore.Audio.Media.DISPLAY_NAME);
+                      while (c.moveToNext()) {
+                          Item it = new Item();
+                          it.id = c.getLong(iId);
+                          it.size = c.getLong(iSize);
+                          String p = iData >= 0 ? c.getString(iData) : null;
+                          if (p == null && iName >= 0) p = c.getString(iName);
+                          it.path = p == null ? ("#" + it.id) : p;
+                          it.uri = ContentUris.withAppendedId(collection, it.id);
+                          out.add(it);
+                      }
+                  }
+                  return out;
+              }
+
+              private static String md5(ContentResolver cr, Uri uri) {
+                  try (InputStream in = cr.openInputStream(uri)) {
+                      if (in == null) return null;
+                      MessageDigest md = MessageDigest.getInstance("MD5");
+                      byte[] buf = new byte[64 * 1024];
+                      int n;
+                      while ((n = in.read(buf)) > 0) md.update(buf, 0, n);
+                      StringBuilder sb = new StringBuilder();
+                      for (byte b : md.digest()) sb.append(String.format(Locale.US, "%02x", b));
+                      return sb.toString();
+                  } catch (Exception e) {
+                      return null;
+                  }
+              }
+
+              private static String mb(long bytes) {
+                  return String.format(Locale.US, "%.1f MB", bytes / (1024.0 * 1024.0));
+              }
+
+              // ---------------- delete ----------------
+
+              private void deleteDuplicates() {
+                  if (toDelete.isEmpty()) return;
+
+                  if (Build.VERSION.SDK_INT >= 30) {
+                      // Android shows its own "Allow" dialog — one tap and they're gone
+                      try {
+                          ArrayList<Uri> uris = new ArrayList<>();
+                          for (Item it : toDelete) uris.add(it.uri);
+                          PendingIntent pi = MediaStore.createDeleteRequest(getContentResolver(), uris);
+                          startIntentSenderForResult(pi.getIntentSender(), REQ_DELETE, null, 0, 0, 0);
+                      } catch (Exception e) {
+                          status.setText("ما قدر يمحي: " + e.getMessage());
+                      }
+                  } else {
+                      new AlertDialog.Builder(this)
+                              .setTitle("محي الملفات المكررة")
+                              .setMessage("رح ينمحى " + toDelete.size() + " ملف (" + mb(bytesToFree) + "). أكيد؟")
+                              .setPositiveButton("امحي", (d, w) -> deleteOldAndroid())
+                              .setNegativeButton("لا", null)
+                              .show();
+                  }
+              }
+
+              private void deleteOldAndroid() {
+                  busy = true;
+                  button.setEnabled(false);
+                  new Thread(() -> {
+                      int n = 0;
+                      ContentResolver cr = getContentResolver();
+                      for (Item it : toDelete) {
+                          boolean ok = false;
+                          try {
+                              File f = new File(it.path);
+                              if (f.exists()) ok = f.delete();
+                          } catch (Exception ignored) { }
+                          try {
+                              if (cr.delete(it.uri, null, null) > 0) ok = true;
+                          } catch (Exception ignored) { }
+                          if (ok) n++;
+                      }
+                      final int count = n;
+                      ui.post(() -> finishDelete(count));
+                  }).start();
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+                  if (requestCode != REQ_DELETE) return;
+                  if (resultCode == RESULT_OK) {
+                      finishDelete(toDelete.size());
+                  } else {
+                      status.setText("انلغى المحي. اضغط الزر إذا بدك تمحي.");
+                  }
+              }
+
+              private void finishDelete(int count) {
+                  busy = false;
+                  long freed = bytesToFree;
+                  toDelete.clear();
+                  bytesToFree = 0;
+                  button.setEnabled(true);
+                  button.setText("افحص مرة تانية");
+                  status.setText("✓ انمحى " + count + " ملف مكرر ووفّرت " + mb(freed));
+              }
+          }
+          EOF_X
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build APK
+        run: gradle assembleRelease --no-daemon
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/release/app-release.apk DupAudioCleaner.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DupAudioCleaner
+          path: DupAudioCleaner.apk
+
+      - name: Publish to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: DupAudioCleaner
+          files: DupAudioCleaner.apk
+          make_latest: true
